@@ -1,103 +1,98 @@
 # DeepAgent 🧠
 
-**Make DeepSeek control your computer automatically.**
+**Turn DeepSeek into an AI that can control your computer.**
 
-DeepAgent is a tool that connects DeepSeek (a website like ChatGPT) directly to your computer's terminal. Instead of just chatting, DeepSeek can open files, run programs, install things, and do pretty much anything you can do from a command line.
-
-Think of it as giving DeepSeek a "remote control" for your PC.
+DeepAgent connects DeepSeek (a website like ChatGPT) to your computer's terminal. Instead of just chatting, DeepSeek can run commands on your PC — list files, install software, run scripts, and more.
 
 ---
 
-## How does it work? 🤔
-
-It's made of two parts that talk to each other:
+## How it works
 
 ```
-[DeepSeek website] ←→ [Chrome extension] ←→ [Python bridge] ←→ [Your computer's terminal]
+[DeepSeek website] ←→ [Chrome extension] ←→ [Python bridge] ←→ [Your terminal]
 ```
 
-1. **Chrome extension** — A small program inside your browser that reads what DeepSeek says.
-2. **Python bridge** — A tiny server running on your computer that executes commands.
-3. When DeepSeek wants to run a command, the extension catches it and sends it to the bridge.
-4. The bridge runs the command on your terminal and sends the result back to DeepSeek.
-5. DeepSeek reads the result and decides what to do next.
-
-It's a loop: **DeepSeek thinks → runs a command → sees the result → thinks again → runs another command...**
+1. A Chrome extension injects a special instruction into the DeepSeek chat.
+2. When DeepSeek replies with a command like `{"action": "execute", "command": "ls -la"}`, the extension detects it.
+3. The command goes to a small Python program running on your computer, which executes it in your terminal.
+4. The output is sent back to DeepSeek, so it can see the result and decide what to do next.
 
 ---
 
-## Which platform do you use?
+## What you need
 
-| Your computer | What to open |
+- **Google Chrome**
+- **Python 3** (the script will check for it)
+- An account at [chat.deepseek.com](https://chat.deepseek.com) (free)
+
+---
+
+## Setup step by step
+
+### 1. Load the Chrome extension
+
+1. Open Chrome and type `chrome://extensions` in the address bar.
+2. Turn on **Developer mode** (toggle in the top-right corner).
+3. Click **Load unpacked**.
+4. Navigate to the `DeepAgent_Extension` folder **inside** your OS folder (Linux, macOS, or Windows).
+
+### 2. Start the bridge
+
+Open the launcher for your system:
+
+| Your OS | File to run |
 |---|---|
-| 🐧 Linux | `DeepAgent_Linux/start.sh` |
-| 🍎 macOS | `DeepAgent_macOS/start.command` |
-| 🪟 Windows | `DeepAgent_Windows/start.bat` |
+| Linux | `DeepAgent_Linux/start.sh` (double-click or run in terminal) |
+| macOS | `DeepAgent_macOS/start.command` (double-click) |
+| Windows | `DeepAgent_Windows/start.bat` (double-click) |
 
----
+A terminal window will open with the bridge running. **Keep it open.**
 
-## What do you need? 📋
-
-- **Python 3** — Don't worry, the script will tell you if you don't have it.
-- **Google Chrome** — The extension lives here.
-- **An account** on [chat.deepseek.com](https://chat.deepseek.com) — It's free.
-
----
-
-## How to install it step by step 🪜
-
-### Step 1: Load the extension into Chrome
-
-1. Open Chrome.
-2. Type `chrome://extensions` in the address bar and press Enter.
-3. Toggle on **Developer mode** (top-right corner).
-4. Click **Load unpacked**.
-5. Navigate to this folder and select the `DeepAgent_Extension` folder **inside** your OS folder (Linux, macOS, or Windows).
-
-### Step 2: Start the bridge
-
-Double-click the launcher file for your system:
-- **Linux:** Right-click → Run as program
-- **macOS:** Double-click `start.command`
-- **Windows:** Double-click `start.bat`
-
-A terminal window will open. Leave it open — that's your bridge running.
-
-### Step 3: Start using it
+### 3. Use it
 
 1. Go to [chat.deepseek.com](https://chat.deepseek.com).
-2. You'll see a small floating panel on the page with a **Start** button.
+2. You'll see a small floating panel in the top-right corner of the page.
 3. Click **Start**.
-4. DeepSeek will now be able to run commands on your computer.
+4. DeepSeek can now run commands on your computer.
 
 ---
 
-## Safety first 🛡️
+## How to talk to DeepSeek
 
-- The bridge **only** listens to DeepSeek's website — no one else can send commands.
-- If DeepSeek tries to use `sudo` (the command that asks for your password), the system detects it and blocks it automatically.
-- Every command is checked to make sure it doesn't run twice by accident.
-- You can see **everything** DeepSeek is doing in real time on the floating panel.
+Just chat normally. DeepSeek will use commands automatically when needed. For example:
 
----
+- *"What files are in my Documents folder?"* → DeepSeek runs `ls ~/Documents`
+- *"Install the Python requests library"* → DeepSeek runs `pip install requests`
+- *"Create a backup of my project"* → DeepSeek runs `cp -r project/ backup/`
 
-## What can DeepSeek do with this?
-
-- 📁 List, create, delete files and folders
-- 📦 Install software
-- 🔍 Search your computer
-- 🐍 Run Python scripts
-- 🌐 Download things from the internet
-- 🛠️ Fix problems
-- Pretty much anything you could type in a terminal
+The panel shows a **green dot** when connected and **red** when offline.
 
 ---
 
-## Having trouble? 😕
+## What it can do
 
-- Make sure the bridge terminal window is still open (it shows a status dot on the page: 🟢 green = connected, 🔴 red = offline).
-- Try closing and reopening the browser tab.
-- Restart the bridge by closing the terminal window and running the launcher again.
+- Browse your files and folders
+- Create, edit, and delete files
+- Install software and packages
+- Run Python, bash, and other scripts
+- Search the web via curl or wget
+- Anything you can do in a terminal
+
+---
+
+## Safety
+
+- The bridge **only** listens to requests from DeepSeek's website — nobody else can send commands.
+- If DeepSeek tries to use `sudo` (a command that asks for your password), the system blocks it automatically.
+- You can see every command DeepSeek runs in real time.
+
+---
+
+## Troubleshooting
+
+- **Panel shows red dot** → Make sure the bridge terminal window is still open.
+- **Nothing happens** → Refresh the DeepSeek page and click Start again.
+- **Extension not loading** → Make sure you selected the right `DeepAgent_Extension` folder (inside your OS folder).
 
 ---
 
