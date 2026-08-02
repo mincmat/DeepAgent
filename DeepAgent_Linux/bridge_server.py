@@ -3,6 +3,8 @@ import http.server
 import json
 import os
 import pty
+import re
+import secrets
 import select
 import signal
 import subprocess
@@ -12,19 +14,76 @@ import time
 import uuid
 
 PORT = 8765
+MAX_BODY = 65536
 
-ALLOWED_ORIGINS = [
-    'https://chat.deepseek.com',
-    'https://chat.deepseek.com/',
-    'chrome-extension://',
-]
+DEEPSEEK_ORIGIN = 'https://chat.deepseek.com'
+CHROME_EXTENSION_PREFIX = 'chrome-extension://'
 
-SUDO_KEYWORDS = [
-    b'huella', b'dedo', b'fingerprint',
-    b'contrase', b'password',
-    b'passphrase', b'sudo password',
-    b'sudo:', b'password for',
-]
+TOKEN_PATH = os.path.expanduser('~/.deepagent/token')
+ALLOWED_EXT_PATH = os.path.expanduser('~/.deepagent/extension_id')
+
+PRIV_CMDS = re.compile(
+    r'('
+    r'\b(sudo|su|sudoedit|pkexec|doas|gksudo|kdesudo|machinectl|nsenter|systemd-run)\b'
+    r'|/usr/bin/(sudo|su|pkexec|doas)'
+    r'|\$\((sudo|su|pkexec|doas)\b'
+    r'|`(sudo|su|pkexec|doas)\b'
+    r'|\benv\s+(sudo|su|pkexec|doas)\b'
+    r'|\b(nice|time|strace|ltrace)\s+(sudo|su|pkexec|doas)\b'
+    r')',
+    re.IGNORECASE,
+)
+
+
+def load_or_create_token():
+    try:
+        with open(TOKEN_PATH) as f:
+            token = f.read().strip()
+        if token:
+            return token
+    except (OSError, IOError):
+        pass
+    token = secrets.token_urlsafe(32)
+    try:
+        os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+        fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(token)
+    except OSError:
+        pass
+    return token
+
+
+TOKEN = load_or_create_token()
+
+
+def _load_allowed_extension():
+    try:
+        with open(ALLOWED_EXT_PATH) as f:
+            ext_id = f.read().strip()
+        if ext_id:
+            return ext_id
+    except (OSError, IOError):
+        pass
+    return None
+
+
+def _save_allowed_extension(ext_id):
+    try:
+        os.makedirs(os.path.dirname(ALLOWED_EXT_PATH), exist_ok=True)
+        fd = os.open(ALLOWED_EXT_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(ext_id)
+    except OSError:
+        pass
+
+
+ALLOWED_EXTENSION_ID = _load_allowed_extension()
+
+
+def _is_privileged(command):
+    return bool(PRIV_CMDS.search(command))
+
 
 class PersistentTerminal:
     def __init__(self):
@@ -187,48 +246,79 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def _check_origin(self):
+        global ALLOWED_EXTENSION_ID
         origin = self.headers.get('Origin', '')
-        if not origin:
+        if origin == DEEPSEEK_ORIGIN:
             return True
-        return any(origin.startswith(a) for a in ALLOWED_ORIGINS)
+        if origin.startswith(CHROME_EXTENSION_PREFIX) and len(origin) > len(CHROME_EXTENSION_PREFIX):
+            ext_id = origin[len(CHROME_EXTENSION_PREFIX):]
+            if ALLOWED_EXTENSION_ID is None:
+                ALLOWED_EXTENSION_ID = ext_id
+                _save_allowed_extension(ext_id)
+                return True
+            if secrets.compare_digest(ext_id, ALLOWED_EXTENSION_ID):
+                return True
+        return False
 
-    def _cors(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS, GET')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+    def _check_host(self):
+        return self.headers.get('Host', '') in ('localhost:8765', '127.0.0.1:8765')
+
+    def _check_token(self):
+        return secrets.compare_digest(self.headers.get('X-DeepAgent-Token', ''), TOKEN)
+
+    def _authorized(self):
+        return self._check_origin() and self._check_host() and self._check_token()
+
+    def _deny(self):
+        self.send_response(403)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({'error': 'unauthorized'}).encode())
 
     def do_GET(self):
-        self._cors()
         if self.path == '/ping':
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             term = get_terminal()
             alive = term.proc is not None and term.proc.poll() is None
             self.wfile.write(json.dumps({
                 'status': 'ok' if alive else 'dead',
-                'pid': os.getpid(),
-                'shell_pid': term.proc.pid if term.proc else 0,
                 'shell_alive': alive,
             }).encode())
         else:
+            self.send_response(404)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({'error': 'not found'}).encode())
 
     def do_OPTIONS(self):
-        self._cors()
+        if not self._check_origin():
+            self.send_response(403)
+            self.end_headers()
+            return
+        origin = self.headers.get('Origin', '')
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', origin)
+        self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-DeepAgent-Token')
+        self.send_header('Vary', 'Origin')
         self.end_headers()
 
     def do_POST(self):
-        if not self._check_origin():
-            self._cors()
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': 'origin not allowed'}).encode())
+        if not self._authorized():
+            self._deny()
             return
 
-        length = int(self.headers.get('Content-Length', 0))
+        try:
+            length = int(self.headers.get('Content-Length', 0) or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > MAX_BODY:
+            self._deny()
+            return
+
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
@@ -240,7 +330,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print('[DeepAgent] RESET terminal')
             sys.stdout.flush()
             get_terminal().restart()
-            self._cors()
+            origin = self.headers.get('Origin', '')
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', origin)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({'stdout': 'Terminal restarted', 'stderr': '', 'returncode': 0}).encode())
@@ -251,7 +343,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         result = self._run(command)
 
-        self._cors()
+        origin = self.headers.get('Origin', '')
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', origin)
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
         self.wfile.write(json.dumps(result).encode())
@@ -262,10 +356,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not cmd:
                 return {'stdout': '', 'stderr': 'empty command', 'returncode': -1}
 
-            if 'sudo' in cmd:
-                print(f'[DeepAgent] SUDO (bypass): {cmd[:100]}...')
+            if _is_privileged(cmd):
+                print(f'[DeepAgent] BLOCKED privileged command: {cmd[:100]}')
                 sys.stdout.flush()
-                return _run_pty(cmd)
+                return {
+                    'stdout': '',
+                    'stderr': '⛔ Privilege-escalation commands (sudo, su, pkexec, doas...) are blocked by DeepAgent for security.',
+                    'returncode': -1,
+                }
 
             term = get_terminal()
             result = term.execute(cmd)
@@ -277,95 +375,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return {'stdout': '', 'stderr': f'✗ error: {e}', 'returncode': -1}
 
 
-def _run_pty(command, timeout=30):
-    master_fd, slave_fd = pty.openpty()
-    proc = subprocess.Popen(
-        command, shell=True,
-        stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-        close_fds=True, preexec_fn=os.setsid,
-    )
-    os.close(slave_fd)
-
-    output = b''
-    start = time.time()
-    timed_out = False
-    prompt_detected = False
-
-    while True:
-        elapsed = time.time() - start
-        if elapsed > timeout:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            timed_out = True
-            break
-
-        r, _, _ = select.select([master_fd], [], [], max(0.1, timeout - elapsed))
-        if r:
-            try:
-                data = os.read(master_fd, 4096)
-                if not data:
-                    break
-                output += data
-            except OSError:
-                break
-
-            if not prompt_detected:
-                lower = output.lower()
-                for kw in SUDO_KEYWORDS:
-                    if kw in lower:
-                        prompt_detected = True
-                        break
-
-            if prompt_detected:
-                time.sleep(0.2)
-                while True:
-                    r2, _, _ = select.select([master_fd], [], [], 0.1)
-                    if not r2:
-                        break
-                    try:
-                        d = os.read(master_fd, 4096)
-                        if not d:
-                            break
-                        output += d
-                    except OSError:
-                        break
-                if proc.poll() is None:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                break
-
-        if proc.poll() is not None:
-            while True:
-                r, _, _ = select.select([master_fd], [], [], 0.1)
-                if not r:
-                    break
-                try:
-                    d = os.read(master_fd, 4096)
-                    if not d:
-                        break
-                    output += d
-                except OSError:
-                    break
-            break
-
-    os.close(master_fd)
-    out = output.decode(errors='replace')
-
-    if prompt_detected:
-        return {
-            'stdout': out,
-            'stderr': '⏸️ sudo requires interactive authentication (fingerprint/password). The command was stopped.',
-            'returncode': -1,
-        }
-    if timed_out:
-        return {'stdout': out, 'stderr': '⏱️ timeout after 30s', 'returncode': -1}
-    return {'stdout': out, 'stderr': '', 'returncode': proc.returncode or 0}
-
-
 if __name__ == '__main__':
     term = get_terminal()
     print(f'DeepAgent bridge on http://localhost:{PORT}')
     print(f'  CWD: {os.getcwd()}')
     print(f'  Persistent terminal: bash (PID {term.proc.pid})')
-    print(f'  Tip: run with "sudo" for root privileges')
+    print(f'  Security token: {TOKEN}')
+    print(f'  Paste this token into the DeepAgent panel in Chrome.')
     sys.stdout.flush()
     try:
         http.server.ThreadingHTTPServer(('localhost', PORT), Handler).serve_forever()

@@ -3,6 +3,8 @@ import ctypes
 import http.server
 import json
 import os
+import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -10,12 +12,23 @@ import time
 import uuid
 
 PORT = 8765
+MAX_BODY = 65536
 
-ALLOWED_ORIGINS = [
-    'https://chat.deepseek.com',
-    'https://chat.deepseek.com/',
-    'chrome-extension://',
-]
+DEEPSEEK_ORIGIN = 'https://chat.deepseek.com'
+CHROME_EXTENSION_PREFIX = 'chrome-extension://'
+
+TOKEN_PATH = os.path.expanduser('~/.deepagent/token')
+ALLOWED_EXT_PATH = os.path.expanduser('~/.deepagent/extension_id')
+
+PRIV_CMDS = re.compile(
+    r'('
+    r'\b(sudo|su|runas|gsudo)\b'
+    r'|\$\((sudo|su|runas|gsudo)\b'
+    r'|`(sudo|su|runas|gsudo)\b'
+    r'|\benv\s+(sudo|su|runas|gsudo)\b'
+    r')',
+    re.IGNORECASE,
+)
 
 ADMIN_ERROR_HINTS = [
     'access is denied',
@@ -28,6 +41,56 @@ ADMIN_ERROR_HINTS = [
     'permission denied',
     'se denegó el acceso',
 ]
+
+
+def load_or_create_token():
+    try:
+        with open(TOKEN_PATH) as f:
+            token = f.read().strip()
+        if token:
+            return token
+    except (OSError, IOError):
+        pass
+    token = secrets.token_urlsafe(32)
+    try:
+        os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+        fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(token)
+    except OSError:
+        pass
+    return token
+
+
+TOKEN = load_or_create_token()
+
+
+def _load_allowed_extension():
+    try:
+        with open(ALLOWED_EXT_PATH) as f:
+            ext_id = f.read().strip()
+        if ext_id:
+            return ext_id
+    except (OSError, IOError):
+        pass
+    return None
+
+
+def _save_allowed_extension(ext_id):
+    try:
+        os.makedirs(os.path.dirname(ALLOWED_EXT_PATH), exist_ok=True)
+        fd = os.open(ALLOWED_EXT_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(ext_id)
+    except OSError:
+        pass
+
+
+ALLOWED_EXTENSION_ID = _load_allowed_extension()
+
+
+def _is_privileged(command):
+    return bool(PRIV_CMDS.search(command))
 
 
 def is_admin():
@@ -204,48 +267,79 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def _check_origin(self):
+        global ALLOWED_EXTENSION_ID
         origin = self.headers.get('Origin', '')
-        if not origin:
+        if origin == DEEPSEEK_ORIGIN:
             return True
-        return any(origin.startswith(a) for a in ALLOWED_ORIGINS)
+        if origin.startswith(CHROME_EXTENSION_PREFIX) and len(origin) > len(CHROME_EXTENSION_PREFIX):
+            ext_id = origin[len(CHROME_EXTENSION_PREFIX):]
+            if ALLOWED_EXTENSION_ID is None:
+                ALLOWED_EXTENSION_ID = ext_id
+                _save_allowed_extension(ext_id)
+                return True
+            if secrets.compare_digest(ext_id, ALLOWED_EXTENSION_ID):
+                return True
+        return False
 
-    def _cors(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS, GET')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+    def _check_host(self):
+        return self.headers.get('Host', '') in ('localhost:8765', '127.0.0.1:8765')
+
+    def _check_token(self):
+        return secrets.compare_digest(self.headers.get('X-DeepAgent-Token', ''), TOKEN)
+
+    def _authorized(self):
+        return self._check_origin() and self._check_host() and self._check_token()
+
+    def _deny(self):
+        self.send_response(403)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({'error': 'unauthorized'}).encode())
 
     def do_GET(self):
-        self._cors()
         if self.path == '/ping':
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             term = get_terminal()
             alive = term.proc is not None and term.proc.poll() is None
             self.wfile.write(json.dumps({
                 'status': 'ok' if alive else 'dead',
-                'pid': os.getpid(),
-                'shell_pid': term.proc.pid if term.proc else 0,
                 'shell_alive': alive,
             }, ensure_ascii=False).encode('utf-8'))
         else:
+            self.send_response(404)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
-            self.wfile.write(json.dumps({'error': 'not found'}).encode('utf-8'))
+            self.wfile.write(json.dumps({'error': 'not found'}, ensure_ascii=False).encode('utf-8'))
 
     def do_OPTIONS(self):
-        self._cors()
+        if not self._check_origin():
+            self.send_response(403)
+            self.end_headers()
+            return
+        origin = self.headers.get('Origin', '')
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', origin)
+        self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-DeepAgent-Token')
+        self.send_header('Vary', 'Origin')
         self.end_headers()
 
     def do_POST(self):
-        if not self._check_origin():
-            self._cors()
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': 'origin not allowed'}, ensure_ascii=False).encode('utf-8'))
+        if not self._authorized():
+            self._deny()
             return
 
-        length = int(self.headers.get('Content-Length', 0))
+        try:
+            length = int(self.headers.get('Content-Length', 0) or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > MAX_BODY:
+            self._deny()
+            return
+
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
@@ -257,7 +351,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print('[DeepAgent] RESET terminal')
             sys.stdout.flush()
             get_terminal().restart()
-            self._cors()
+            origin = self.headers.get('Origin', '')
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', origin)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(json.dumps({'stdout': 'Terminal restarted', 'stderr': '', 'returncode': 0}, ensure_ascii=False).encode('utf-8'))
@@ -268,7 +364,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         result = self._run(command)
 
-        self._cors()
+        origin = self.headers.get('Origin', '')
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', origin)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         self.wfile.write(json.dumps(result, ensure_ascii=False).encode('utf-8'))
@@ -279,20 +377,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not cmd:
                 return {'stdout': '', 'stderr': 'empty command', 'returncode': -1}
 
-            stripped_sudo = False
-            if cmd.lower().startswith('sudo '):
-                cmd = cmd[5:].strip()
-                stripped_sudo = True
+            if _is_privileged(cmd):
+                print(f'[DeepAgent] BLOCKED privileged command: {cmd[:100]}')
+                sys.stdout.flush()
+                return {
+                    'stdout': '',
+                    'stderr': '⛔ Privilege-escalation commands (sudo, su, runas...) are blocked by DeepAgent for security.',
+                    'returncode': -1,
+                }
 
             term = get_terminal()
             result = term.execute(cmd)
-
-            if stripped_sudo:
-                result['stderr'] = (
-                    'ℹ️ Windows does not use "sudo": ignored it and ran the rest of the command as is.\n'
-                    + result['stderr']
-                ).strip()
-
             print(f'[DeepAgent] < exit={result["returncode"]} ({len(result["stdout"] + result["stderr"])} chars)')
             sys.stdout.flush()
             return result
@@ -308,6 +403,9 @@ def main():
     print(f'  Current folder: {os.getcwd()}')
     print(f'  Terminal persistente: cmd.exe (PID {term.proc.pid})')
     print(f'  Administrador: {"SI" if is_admin() else "NO"}')
+    print(f'  Security token: {TOKEN}')
+    print(f'  Paste this token into the DeepAgent panel in Chrome.')
+    print(f'  Privilege-escalation commands (sudo, runas...) are blocked.')
     if not is_admin():
         print('  Tip: if a command asks for admin permissions,')
         print('  close this window and run start.bat as administrator.')

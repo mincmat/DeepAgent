@@ -3,7 +3,14 @@
 
   const PROMPT_SIGNATURE = 'DeepAgent, an AI assistant with FULL control';
 
-  const AGENT_PROMPT = `You are DeepAgent, an AI assistant with FULL control over a Linux computer.
+  // Platform detection
+  const ua = navigator.userAgent.toLowerCase();
+  const isMac = ua.includes('mac os') || ua.includes('macintosh');
+  const isWin = ua.includes('windows');
+  const isLinux = !isMac && !isWin;
+
+  const AGENT_PROMPTS = {
+    linux: `You are DeepAgent, an AI assistant with FULL control over a Linux computer.
 
 You have a PERSISTENT terminal session (bash). Each command runs in the SAME shell, so state (cd, variables, aliases, etc.) persists between commands. To execute a command, output it in a code block with triple backticks:
 
@@ -22,17 +29,84 @@ CRITICAL: Use \`\`\` triple backticks. Never write "json" on its own line.
 \`{"action": "execute", "command": "<shell-command>"}\` — runs the command and returns stdout, stderr and exit code.
 
 ## Capabilities
-- cd, sudo, export, file read/write/edit, package management, services, scripts, git, python, etc.
+- cd, file read/write/edit, package management, services, scripts, git, python, etc.
 
 ## Notes
 - Commands time out after 30s
-- sudo may require interactive authentication (fingerprint/password) — if so, the command will be stopped and you'll receive a message saying so
+- sudo, su, pkexec, doas and other privilege-escalation commands are BLOCKED by the bridge — never use them
 - The terminal is persistent: environment variables, working directory, and shell state persist between commands
 - You can break complex tasks into multiple sequential commands
 
-Reply to the user conversationally. Execute commands as needed to fulfill their request — you don't need to ask permission for each step. Break down complex tasks into multiple commands, one per message.`;
+Reply to the user conversationally. Every command you send is shown to the user and must be approved before it runs — send ONE command at a time and wait for the result. If the user declines a command, adapt your approach.`,
+
+    macos: `You are DeepAgent, an AI assistant with FULL control over a macOS computer.
+
+You have a PERSISTENT terminal session (zsh). Each command runs in the SAME shell, so state (cd, variables, exports) persists between commands. To execute a command, output it in a code block with triple backticks:
+
+\`\`\`json
+{"action": "execute", "command": "the-command-here"}
+\`\`\`
+
+CRITICAL: Use \`\`\` triple backticks. Never write "json" on its own line.
+
+## How it works
+- Send ONE command per message. Multiple commands per message will be ignored.
+- Wait for the output before sending the next command. Do NOT send a new command until you receive the result.
+- The output you receive is the raw terminal output (stdout + stderr).
+
+## Available action
+\`{"action": "execute", "command": "<shell-command>"}\` — runs the command in zsh and returns stdout, stderr and exit code.
+
+## Capabilities
+- cd, export, file operations, git, python3, brew, curl, etc.
+- macOS-specific: open, defaults, pbcopy/pbpaste, osascript (AppleScript), plutil, diskutil, system_profiler, networksetup, security, mdls, mdfind
+- Package managers: brew (Homebrew), pip3, gem, npm
+- Service management: launchctl (launchd), brew services
+
+## Notes
+- Commands time out after 30s
+- sudo, su, pkexec, doas and other privilege-escalation commands are BLOCKED by the bridge — never use them
+- The terminal is persistent: working directory, environment variables, and shell state persist between commands
+- Use macOS syntax, not Linux syntax (e.g. "open ." not "xdg-open .", "pbcopy" not "xclip", "system_profiler" not "lshw")
+- Homebrew is available at /opt/homebrew/bin/brew (Apple Silicon) or /usr/local/bin/brew (Intel)
+
+Reply to the user conversationally. Every command you send is shown to the user and must be approved before it runs — send ONE command at a time and wait for the result. If the user declines a command, adapt your approach.`,
+
+    windows: `You are DeepAgent, an AI assistant with FULL control over a Windows computer.
+
+You have a PERSISTENT terminal session (cmd.exe). Each command runs in the SAME shell, so state (cd, environment variables) persists between commands. To execute a command, output it in a code block with triple backticks:
+
+\`\`\`json
+{"action": "execute", "command": "the-command-here"}
+\`\`\`
+
+CRITICAL: Use \`\`\` triple backticks. Never write "json" on its own line.
+
+## How it works
+- Send ONE command per message. Multiple commands per message will be ignored.
+- Wait for the output before sending the next command. Do NOT send a new command until you receive the result.
+- The output you receive is the raw terminal output (stdout + stderr).
+
+## Available action
+\`{"action": "execute", "command": "<command>"}\` — runs the command in cmd.exe and returns stdout, stderr and exit code.
+
+## Capabilities
+- Windows commands (dir, copy, del, type, move, etc.), PowerShell one-liners, package managers (winget, choco if installed), services (sc, Get-Service), scripts, git, python, pip
+
+## Notes
+- Commands time out after 30s
+- Windows does NOT have sudo. Never write "sudo". Privilege-escalation commands (sudo, su, runas) are BLOCKED by the bridge
+- If a command needs administrator rights it will fail with an "access denied" error — when that happens, tell the user to close the bridge server window and reopen start.bat with right click → "Run as administrator"
+- Use Windows syntax, not Linux syntax (e.g. "dir" not "ls", "del" not "rm", "type" not "cat")
+- The terminal is persistent: working directory and environment persist between commands
+
+Reply to the user conversationally. Every command you send is shown to the user and must be approved before it runs — send ONE command at a time and wait for the result. If the user declines a command, adapt your approach.`
+  };
+
+  const AGENT_PROMPT = isMac ? AGENT_PROMPTS.macos : (isWin ? AGENT_PROMPTS.windows : AGENT_PROMPTS.linux);
 
   const STORAGE_KEY = 'deepagent_state';
+  const TOKEN_STORAGE_KEY = 'deepagent_token';
 
   let _userStopped = false;
 
@@ -40,6 +114,8 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
     observer: null,
     panel: null,
     commandQueue: [],
+    pendingQueue: [],
+    tokenSaved: false,
     processing: false,
     executedHashes: new Set(),
     _urlCheckTimer: null,
@@ -69,6 +145,15 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
         if (data && Array.isArray(data.hashes)) {
           state.executedHashes = new Set(data.hashes);
         }
+        resolve();
+      });
+    });
+  }
+
+  function loadToken() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(TOKEN_STORAGE_KEY, (res) => {
+        state.tokenSaved = !!(res[TOKEN_STORAGE_KEY] || '').trim();
         resolve();
       });
     });
@@ -289,6 +374,41 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
     processQueue();
   }
 
+  /* ── Command approval (user must confirm each command) ── */
+
+  function updatePendingUI() {
+    const pendingEl = state.panel?.querySelector('.da-pending');
+    const cmdEl = state.panel?.querySelector('.da-cmd');
+    const countEl = state.panel?.querySelector('.da-pending-count');
+    if (!pendingEl) return;
+    if (state.pendingQueue.length === 0) {
+      pendingEl.hidden = true;
+      return;
+    }
+    pendingEl.hidden = false;
+    const cmd = state.pendingQueue[0];
+    cmdEl.textContent = cmd.length > 80 ? cmd.slice(0, 77) + '...' : cmd;
+    if (countEl) {
+      countEl.textContent = state.pendingQueue.length > 1
+        ? `+${state.pendingQueue.length - 1} more`
+        : '';
+    }
+  }
+
+  function approveCurrent() {
+    if (state.pendingQueue.length === 0) return;
+    const cmd = state.pendingQueue.shift();
+    updatePendingUI();
+    updatePanelStatus();
+    queueCommand(cmd);
+  }
+
+  function rejectCurrent() {
+    state.pendingQueue.shift();
+    updatePendingUI();
+    updatePanelStatus();
+  }
+
   /* ── JSON extraction ───────────────────────────────────── */
 
   function parseJSONFromText(text) {
@@ -312,12 +432,14 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
     return null;
   }
 
-  function queueIfValid(data) {
+  function promptIfValid(data) {
     const h = hashCommand(data.command);
     if (state.executedHashes.has(h)) return;
     state.executedHashes.add(h);
-    console.log('[DeepAgent] Command:', data.command.slice(0, 100));
-    queueCommand(data.command);
+    console.log('[DeepAgent] Command waiting for approval:', data.command.slice(0, 100));
+    state.pendingQueue.push(data.command);
+    updatePendingUI();
+    updatePanelStatus();
     persist();
   }
 
@@ -328,7 +450,7 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
       if (block.dataset.daText === text) continue;
       block.dataset.daText = text;
       const data = parseJSONFromText(text);
-      if (data) { queueIfValid(data); count++; }
+      if (data) { promptIfValid(data); count++; }
     }
     const msg = findLastAssistant();
     if (msg) {
@@ -336,10 +458,10 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
       if (msg.dataset.daText !== text) {
         msg.dataset.daText = text;
         const data = parseJSONFromText(text);
-        if (data) { queueIfValid(data); count++; }
+        if (data) { promptIfValid(data); count++; }
       }
     }
-    if (count > 0) console.log('[DeepAgent] Queued', count, 'command(s)');
+    if (count > 0) console.log('[DeepAgent] Queued', count, 'command(s) for approval');
   }
 
   function findLastAssistant() {
@@ -373,19 +495,17 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
       state.observer = null;
     }
     state.commandQueue = [];
+    state.pendingQueue = [];
     state._currentCommand = null;
     state.processing = false;
+    updatePendingUI();
     updatePanel(false);
     console.log('[DeepAgent] Agent stopped');
   }
 
   function checkChatState() {
-    if (_userStopped) return;
     const hasPrompt = promptInDOM();
-    if (hasPrompt && !state.observer) {
-      console.log('[DeepAgent] Prompt detected — auto-starting');
-      startAgent();
-    } else if (!hasPrompt && state.observer) {
+    if (!hasPrompt && state.observer) {
       console.log('[DeepAgent] No prompt in this chat — stopping');
       stopAgent();
     }
@@ -412,17 +532,17 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
   function updatePanelStatus() {
     const status = state.panel?.querySelector('.da-status');
     if (!status) return;
+    const parts = [];
+    if (state.pendingQueue.length > 0) {
+      parts.push(`⏳ ${state.pendingQueue.length} command(s) waiting approval`);
+    }
     if (state._currentCommand) {
       const cmd = state._currentCommand.length > 30
         ? state._currentCommand.slice(0, 30) + '…'
         : state._currentCommand;
-      const q = state.commandQueue.length;
-      status.textContent = q > 0 ? `▶ ${cmd} (+${q})` : `▶ ${cmd}`;
-    } else if (state.commandQueue.length > 0) {
-      status.textContent = `⏳ ${state.commandQueue.length} queued`;
-    } else {
-      status.textContent = '';
+      parts.push(`▶ ${cmd}`);
     }
+    status.textContent = parts.join(' · ');
   }
 
   let _healthTimer = null;
@@ -493,13 +613,29 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
     startAgent();
   }
 
+  function saveToken() {
+    const input = state.panel?.querySelector('.da-token-input');
+    if (!input) return;
+    const token = (input.value || '').trim();
+    if (!token) {
+      input.focus();
+      return;
+    }
+    chrome.storage.local.set({ [TOKEN_STORAGE_KEY]: token }, () => {
+      state.tokenSaved = true;
+      const row = state.panel.querySelector('.da-token');
+      if (row) row.hidden = true;
+      updatePanel(false);
+    });
+  }
+
   function createPanel() {
     const styleId = 'deepagent-style';
     if (!document.getElementById(styleId)) {
       const s = document.createElement('style');
       s.id = styleId;
       s.textContent = [
-        '#deepagent-panel{all:initial;position:fixed;top:20px;right:20px;z-index:2147483647;background:#0f0f1a;border:1px solid #2a2a4a;border-radius:14px;padding:12px 18px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:13px;color:#d0d0e0;box-shadow:0 8px 40px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:6px;min-width:220px;user-select:none;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}',
+        '#deepagent-panel{all:initial;position:fixed;top:20px;right:20px;z-index:2147483647;background:#0f0f1a;border:1px solid #2a2a4a;border-radius:14px;padding:12px 18px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:13px;color:#d0d0e0;box-shadow:0 8px 40px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:6px;min-width:260px;user-select:none;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}',
         '#deepagent-panel .da-row{display:flex;align-items:center;gap:10px}',
         '#deepagent-panel .da-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;transition:background .3s}',
         '#deepagent-panel .da-dot.off{background:#ef4444;box-shadow:0 0 8px #ef444488}',
@@ -511,6 +647,18 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
         '#deepagent-panel .da-btn.active{background:#22c55e;color:#0a0a12}',
         '#deepagent-panel .da-btn.active:hover{background:#1da34e}',
         '#deepagent-panel .da-status{font-size:11px;color:#8888aa;padding:0 2px;min-height:16px;word-break:break-all}',
+        '#deepagent-panel .da-token{display:flex;flex-direction:column;gap:4px}',
+        '#deepagent-panel .da-token-input{background:#1a1a2e;border:1px solid #2a2a4a;border-radius:6px;color:#d0d0e0;padding:4px 8px;font-size:11px;width:100%;box-sizing:border-box;outline:none}',
+        '#deepagent-panel .da-token-input:focus{border-color:#4a4a8a}',
+        '#deepagent-panel .da-token-save{background:#2a2a4a;border:none;color:#d0d0e0;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;align-self:flex-end}',
+        '#deepagent-panel .da-token-save:hover{background:#3a3a5a}',
+        '#deepagent-panel .da-pending{display:flex;flex-direction:column;gap:4px;border-top:1px solid #2a2a4a;padding-top:6px}',
+        '#deepagent-panel .da-cmd{font-size:11px;color:#ffd28a;word-break:break-all;max-height:60px;overflow-y:auto;background:#1a1a2e;border-radius:6px;padding:4px 8px}',
+        '#deepagent-panel .da-pending-count{font-size:10px;color:#8888aa}',
+        '#deepagent-panel .da-approve{background:#22c55e;border:none;color:#0a0a12;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;flex:1}',
+        '#deepagent-panel .da-approve:hover{background:#1da34e}',
+        '#deepagent-panel .da-deny{background:#3a3a5a;border:none;color:#d0d0e0;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;flex:1}',
+        '#deepagent-panel .da-deny:hover{background:#4a4a6a}',
       ].join('');
       document.head.appendChild(s);
     }
@@ -522,16 +670,41 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
         '<span class="da-label">Agent Stopped</span>' +
         '<button class="da-btn">Start</button>' +
       '</div>' +
+      '<div class="da-token" hidden>' +
+        '<input class="da-token-input" type="password" placeholder="Paste the security token from the bridge window" />' +
+        '<button class="da-token-save">Save token</button>' +
+      '</div>' +
+      '<div class="da-pending" hidden>' +
+        '<div class="da-cmd"></div>' +
+        '<div class="da-pending-count"></div>' +
+        '<div class="da-row">' +
+          '<button class="da-approve">✓ Run</button>' +
+          '<button class="da-deny">✗ Skip</button>' +
+        '</div>' +
+      '</div>' +
       '<div class="da-status"></div>';
     document.body.appendChild(panel);
     state.panel = panel;
     console.log('[DeepAgent] Panel injected');
+
+    panel.querySelector('.da-token-save').addEventListener('click', saveToken);
+    panel.querySelector('.da-token-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') saveToken();
+    });
+    panel.querySelector('.da-approve').addEventListener('click', approveCurrent);
+    panel.querySelector('.da-deny').addEventListener('click', rejectCurrent);
 
     panel.querySelector('.da-btn').addEventListener('click', () => {
       if (state.observer) {
         _userStopped = true;
         stopAgent();
       } else {
+        if (!state.tokenSaved) {
+          const row = panel.querySelector('.da-token');
+          row.hidden = false;
+          panel.querySelector('.da-token-input').focus();
+          return;
+        }
         injectPromptAndStart();
       }
     });
@@ -544,11 +717,11 @@ Reply to the user conversationally. Execute commands as needed to fulfill their 
       await new Promise((r) => document.addEventListener('DOMContentLoaded', r));
     }
     await loadHashes();
+    await loadToken();
     createPanel();
     startHealthCheck();
     watchUrl();
     state._lastUrl = location.href;
-    checkChatState();
   }
 
   bootstrap();

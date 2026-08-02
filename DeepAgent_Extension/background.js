@@ -1,8 +1,22 @@
+const TOKEN_STORAGE_KEY = 'deepagent_token';
+
+function getToken() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(TOKEN_STORAGE_KEY, (res) => {
+      resolve(res[TOKEN_STORAGE_KEY] || '');
+    });
+  });
+}
+
 async function bridgeFetch(endpoint, body) {
+  const token = await getToken();
   const url = `http://localhost:8765${endpoint}`;
   const resp = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-DeepAgent-Token': token,
+    },
     body: JSON.stringify(body),
   });
   return resp.json();

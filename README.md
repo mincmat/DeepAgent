@@ -34,7 +34,7 @@ DeepAgent connects DeepSeek (a website like ChatGPT) to your computer's terminal
 1. Open Chrome and type `chrome://extensions` in the address bar.
 2. Turn on **Developer mode** (toggle in the top-right corner).
 3. Click **Load unpacked**.
-4. Navigate to the `DeepAgent_Extension` folder **inside** your OS folder (Linux, macOS, or Windows).
+4. Navigate to the `DeepAgent_Extension` folder at the root of the project.
 
 ### 2. Start the bridge
 
@@ -52,8 +52,9 @@ A terminal window will open with the bridge running. **Keep it open.**
 
 1. Go to [chat.deepseek.com](https://chat.deepseek.com).
 2. You'll see a small floating panel in the top-right corner of the page.
-3. Click **Start**.
-4. DeepSeek can now run commands on your computer.
+3. Paste the **security token** shown in the bridge terminal window into the panel and save it (only needed once).
+4. Click **Start**.
+5. DeepSeek can now run commands on your computer. Each command is shown in the panel — click **✓ Run** to approve it or **✗ Skip** to decline.
 
 ---
 
@@ -82,8 +83,11 @@ The panel shows a **green dot** when connected and **red** when offline.
 
 ## Safety
 
-- The bridge **only** listens to requests from DeepSeek's website — nobody else can send commands.
-- If DeepSeek tries to use `sudo` (a command that asks for your password), the system blocks it automatically.
+- Every request must pass a **random security token** that the bridge generates and prints in its terminal window. You paste it once into the extension panel — without it, nobody can send commands.
+- The bridge only accepts requests from `chat.deepseek.com` or the Chrome extension, and only on `localhost` — requests from any other website, subdomain or local process are rejected with `403`.
+- **`sudo`, `su`, `pkexec`, `doas` and other privilege-escalation commands are blocked outright** — the bridge refuses them before running anything.
+- Every command needs your approval in the panel: click **✓ Run** to allow it or **✗ Skip** to decline. Nothing executes silently.
+- The agent **never auto-starts**: it only activates when you click **Start** in the panel.
 - You can see every command DeepSeek runs in real time.
 
 ---
@@ -91,8 +95,10 @@ The panel shows a **green dot** when connected and **red** when offline.
 ## Troubleshooting
 
 - **Panel shows red dot** → Make sure the bridge terminal window is still open.
+- **Commands never run / panel shows the token field** → Paste the token printed by the bridge into the panel and save it.
+- **Panel shows "unauthorized"** → The token is wrong or was changed (the bridge regenerates it if you delete `~/.deepagent/token`). Save the new one.
 - **Nothing happens** → Refresh the DeepSeek page and click Start again.
-- **Extension not loading** → Make sure you selected the right `DeepAgent_Extension` folder (inside your OS folder).
+- **Extension not loading** → Make sure you selected the `DeepAgent_Extension` folder at the root of the project.
 
 ---
 
